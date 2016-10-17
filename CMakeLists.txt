@@ -64,4 +64,4 @@ endif()
 
 
 add_executable(bench bench.cpp)
-target_link_libraries(bench ${Boost_LIBRARIES} ${VEXCL_BACKEND})
+target_link_libraries(bench ${Boost_LIBRARIES} ${VEXCL_BACKEND_LIBRARIES})
