@@ -88,6 +88,10 @@ void run_benchmark(int m) {
     vex::Context ctx(vex::Filter::Env && vex::Filter::Count(1));
     std::cout << ctx << std::endl;
 
+#if defined(VEXCL_BACKEND_CUDA)
+    vex::push_compile_options(ctx, "-Xcompiler -std=c++03");
+#endif
+
     amgcl::backend::enable_static_matrix_for_vexcl(ctx);
 
     vex::profiler<> prof(ctx);
