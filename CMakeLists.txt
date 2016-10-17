@@ -42,7 +42,7 @@ if (VEXCL_ROOT)
     if ("${VEXCL_BACKEND}" STREQUAL "OpenCL")
         find_package(OpenCL REQUIRED)
         include_directories( ${OPENCL_INCLUDE_DIRS} )
-        set(VEXCL_BACKEND_LIBRARIES ${OPENCL_LIBRARIES})
+        set(VEXCL_BACKEND_LIBRARIES ${OpenCL_LIBRARIES})
         add_definitions(-DVEXCL_BACKEND_OPENCL)
     elseif ("${VEXCL_BACKEND}" STREQUAL "CUDA")
         find_package(CUDA REQUIRED)
@@ -52,7 +52,7 @@ if (VEXCL_ROOT)
     endif()
 endif()
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-ignored-attributes")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-ignored-attributes -Wno-deprecated-declarations")
 
 #----------------------------------------------------------------------------
 # Find AMGCL
