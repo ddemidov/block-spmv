@@ -4,6 +4,7 @@
 #include <boost/program_options.hpp>
 #include <amgcl/value_type/static_matrix.hpp>
 #include <amgcl/adapter/block_matrix.hpp>
+#include <amgcl/adapter/crs_tuple.hpp>
 #include <amgcl/backend/vexcl_static_matrix.hpp>
 
 #include <amgcl/io/mm.hpp>
@@ -85,6 +86,8 @@ int poisson3d(
 //---------------------------------------------------------------------------
 template <int B>
 void run_benchmark(int m) {
+    namespace math = amgcl::math;
+
     vex::Context ctx(vex::Filter::Env && vex::Filter::Count(1));
     std::cout << ctx << std::endl;
 
@@ -101,19 +104,48 @@ void run_benchmark(int m) {
     int n = poisson3d(m, ptr, col, val);
     prof.toc("assemble");
 
-    prof.tic_cl("transfer");
-    vex::sparse::ell<block<B,B>,int> A(ctx, n, n, ptr, col, val);
-    prof.toc("transfer");
+    // VexCL
+    {
+        prof.tic_cl("vexcl");
+        prof.tic_cl("transfer");
+        vex::sparse::ell<block<B,B>,int> A(ctx, n, n, ptr, col, val);
+        prof.toc("transfer");
 
-    vex::vector<block<B,1>> x(ctx, n), y(ctx, n);
+        vex::vector<block<B,1>> x(ctx, n), y(ctx, n);
 
-    x = amgcl::math::constant<block<B,1>>(1.0);
-    y = A * x;
-
-    prof.tic_cl("spmv (scalar) x100");
-    for(int i = 0; i < 100; ++i)
+        x = math::constant<block<B,1>>(1.0);
         y = A * x;
-    prof.toc("spmv (scalar) x100");
+
+        prof.tic_cl("spmv (block) x100");
+        for(int i = 0; i < 100; ++i)
+            y = A * x;
+        prof.toc("spmv (block) x100");
+        prof.toc("vexcl");
+    }
+
+    // CPU
+    {
+        prof.tic_cpu("cpu");
+
+        std::vector<block<B,1>> x(n), y(n);
+
+        for(auto &v : x) v = math::constant<block<B,1>>(1.0);
+
+        prof.tic_cpu("spmv (block) x100");
+        for(int k = 0; k < 100; ++k) {
+            amgcl::backend::spmv(1.0, boost::tie(n, ptr, col, val), x, 0.0, y);
+            /*
+            for(int i = 0; i < n; ++i) {
+                block<B,1> s = math::zero<block<B,1>>();
+                for(int j = ptr[i], e = ptr[i+1]; j < e; ++j)
+                    s += val[j] * x[col[j]];
+                y[i] = s;
+            }
+            */
+        }
+        prof.toc("spmv (block) x100");
+        prof.toc("cpu");
+    }
 
     std::cout << prof << std::endl;
 }
