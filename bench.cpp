@@ -200,11 +200,20 @@ int main(int argc, char *argv[]) {
         case 1:
             run_benchmark<1>(vm["size"].as<int>());
             break;
+	case 2:
+            run_benchmark<2>(vm["size"].as<int>());
+            break;
+	case 3:
+            run_benchmark<3>(vm["size"].as<int>());
+            break;
         case 4:
             run_benchmark<4>(vm["size"].as<int>());
             break;
+	case 5:
+            run_benchmark<5>(vm["size"].as<int>());
+            break;
         default:
-            std::cerr << "Unsopported block size" << std::endl;
+            std::cerr << "Unsupported block size" << std::endl;
             return 1;
     }
 }
