@@ -183,16 +183,17 @@ void run_benchmark(int m) {
     }
 
     // CPU
+    std::vector<block<B,1>> Y(n);
     {
         prof.tic_cpu("cpu");
 
-        std::vector<block<B,1>> x(n), y(n);
+        std::vector<block<B,1>> x(n);
 
         for(auto &v : x) v = math::constant<block<B,1>>(1.0);
 
         prof.tic_cpu("spmv x100");
         for(int i = 0; i < 100; ++i)
-            amgcl::backend::spmv(1.0, boost::tie(n, ptr, col, val), x, 0.0, y);
+            amgcl::backend::spmv(1.0, boost::tie(n, ptr, col, val), x, 0.0, Y);
         prof.toc("spmv x100");
         prof.toc("cpu");
     }
@@ -207,7 +208,7 @@ void run_benchmark(int m) {
         prof.tic_cl("convert");
         vex::vector<double> ell_val(ctx, A.ell_pitch * A.ell_width * B * B);
         typedef block<B,B> block_BB;
-        VEX_FUNCTION(void, chidx, (int, i)(int, n)(block_BB*, v_in)(double*, v_out)(int, B),
+        VEX_FUNCTION(void, chidx, (int, i)(int, n)(const block_BB*, v_in)(double*, v_out)(int, B),
                 for(int j = 0, m = 0; j < B; ++j)
                     for(int k = 0; k < B; ++k, ++m)
                         v_out[m * n + i] = v_in[i](j,k);
@@ -220,7 +221,8 @@ void run_benchmark(int m) {
                 ctx, {0, A.ell_pitch * A.ell_width});
         prof.toc("convert");
 
-        vex::vector<block<B,1>> x(ctx, n), y(ctx, n);
+        vex::vector<block<B,1>> x(ctx, n);
+        vex::vector<double> y(ctx, n * B);
         x = math::constant<block<B,1>>(1.0);
 
         auto &K = spmv_kernel<B>(ctx.queue(0));
@@ -233,6 +235,15 @@ void run_benchmark(int m) {
                     A.ell_col, ell_val(0), x(0), y(0));
         prof.toc("spmv x100");
         prof.toc("custom");
+
+        prof.tic_cl("checking");
+        auto v = y.map(0);
+        double delta = 0;
+        for(int i = 0; i < n; ++i)
+            for(int k = 0; k < B; ++k)
+                delta += std::abs(Y[i](k) - v[k*n+i]);
+        std::cout << "delta = " << delta << std::endl;
+        prof.toc("checking");
     }
 
     std::cout << prof << std::endl;
@@ -275,9 +286,11 @@ int main(int argc, char *argv[]) {
     }
 
     switch(vm["block-size"].as<int>()) {
+        /*
         case 1:
             run_benchmark<1>(vm["size"].as<int>());
             break;
+        */
 	case 2:
             run_benchmark<2>(vm["size"].as<int>());
             break;
