@@ -14,15 +14,25 @@
 #include <vexcl/sparse/ell.hpp>
 
 template <int N, int M>
-using block = amgcl::static_matrix<double, N, M>;
+struct Block {
+    typedef amgcl::static_matrix<double, N, M> type;
+};
+
+template <>
+struct Block<1,1> {
+    typedef double type;
+};
+
+template <int N, int M>
+using block = typename Block<N,M>::type;
 
 //---------------------------------------------------------------------------
-template <int B>
+template <class B>
 int poisson3d(
         int n,
         std::vector<int> &ptr,
         std::vector<int> &col,
-        std::vector< block<B,B> > &val
+        std::vector< B > &val
         )
 {
     namespace math = amgcl::math;
@@ -37,7 +47,7 @@ int poisson3d(
     col.reserve(n3 * 7);
     val.reserve(n3 * 7);
 
-    block<B,B> one = math::constant<block<B,B>>(1.0);
+    B one = math::constant<B>(1.0);
     ptr.push_back(0);
     for(int k = 0, idx = 0; k < n; ++k) {
         for(int j = 0; j < n; ++j) {
@@ -187,6 +197,9 @@ int main(int argc, char *argv[]) {
     }
 
     switch(vm["block-size"].as<int>()) {
+        case 1:
+            run_benchmark<1>(vm["size"].as<int>());
+            break;
         case 4:
             run_benchmark<4>(vm["size"].as<int>());
             break;
