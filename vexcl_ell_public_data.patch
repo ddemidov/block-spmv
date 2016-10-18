@@ -1,0 +1,22 @@
+diff --git a/vexcl/sparse/ell.hpp b/vexcl/sparse/ell.hpp
+index e4f0650..a8884f2 100644
+--- a/vexcl/sparse/ell.hpp
++++ b/vexcl/sparse/ell.hpp
+@@ -308,7 +308,7 @@ class ell {
+         size_t rows()     const { return n; }
+         size_t cols()     const { return m; }
+         size_t nonzeros() const { return nnz; }
+-    private:
++    //private:
+         backend::command_queue q;
+ 
+         size_t n, m, nnz, ell_width, ell_pitch, csr_nnz;
+@@ -319,7 +319,7 @@ class ell {
+         backend::device_vector<Ptr> csr_ptr;
+         backend::device_vector<Col> csr_col;
+         backend::device_vector<Val> csr_val;
+-
++    private:
+         backend::kernel& csr2ell_kernel() const {
+             using namespace vex::detail;
+             static kernel_cache cache;
