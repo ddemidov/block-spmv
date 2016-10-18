@@ -54,17 +54,17 @@ int poisson3d(
             for (int i = 0; i < n; ++i, ++idx) {
                 if (k > 0) {
                     col.push_back(idx - n * n);
-                    val.push_back(-0.25 * one);
+                    val.push_back(-(1.0/6) * one);
                 }
 
                 if (j > 0) {
                     col.push_back(idx - n);
-                    val.push_back(-0.25 * one);
+                    val.push_back(-(1.0/6) * one);
                 }
 
                 if (i > 0) {
                     col.push_back(idx - 1);
-                    val.push_back(-0.25 * one);
+                    val.push_back(-(1.0/6) * one);
                 }
 
                 col.push_back(idx);
@@ -72,17 +72,17 @@ int poisson3d(
 
                 if (i + 1 < n) {
                     col.push_back(idx + 1);
-                    val.push_back(-0.25 * one);
+                    val.push_back(-(1.0/6) * one);
                 }
 
                 if (j + 1 < n) {
                     col.push_back(idx + n);
-                    val.push_back(-0.25 * one);
+                    val.push_back(-(1.0/6) * one);
                 }
 
                 if (k + 1 < n) {
                     col.push_back(idx + n * n);
-                    val.push_back(-0.25 * one);
+                    val.push_back(-(1.0/6) * one);
                 }
 
                 ptr.push_back( col.size() );
@@ -91,6 +91,55 @@ int poisson3d(
     }
 
     return n3;
+}
+
+//---------------------------------------------------------------------------
+template <int B>
+vex::backend::kernel& spmv_kernel(vex::backend::command_queue &q) {
+    using namespace vex;
+    using namespace vex::detail;
+    static kernel_cache cache;
+
+    auto K = cache.find(q);
+    if (K == cache.end()) {
+        backend::source_generator src(q);
+
+        src.kernel("spmv").open("(")
+            .template parameter<int>("n")
+            .template parameter<int>("ell_width")
+            .template parameter<int>("ell_pitch")
+            .template parameter< global_ptr<const int> >("ell_col")
+            .template parameter< global_ptr<const double> >("ell_val")
+            .template parameter< global_ptr<const double> >("X")
+            .template parameter< global_ptr<double> >("Y")
+            .close(")").open("{").grid_stride_loop().open("{");
+
+        typedef block<B,B> A_type;
+        typedef block<B,1> v_type;
+
+        src.new_line() << type_name<A_type>() << " A;";
+        src.new_line() << type_name<v_type>() << " x;";
+        src.new_line() << type_name<v_type>() << " y = {};";
+
+        src.new_line() << "for(int j = 0; j < ell_width; ++j)";
+        src.open("{");
+        src.new_line() << "int c = ell_col[j * ell_pitch + idx];";
+        src.new_line() << "if (c == -1) break;";
+        for(int k = 0; k < B*B; ++k)
+            src.new_line() << "A(" << k << ") = ell_val[" << k << " * ell_pitch * ell_width + j * ell_pitch + idx];";
+        for(int k = 0; k < B; ++k)
+            src.new_line() << "x(" << k << ") = X[" << k << " * n + c];";
+        src.new_line() << "y += A * x;";
+        src.close("}");
+        for(int k = 0; k < B; ++k)
+            src.new_line() << "Y[" << k << " * n + idx] = y(" << k << ");";
+        src.close("}");
+        src.close("}");
+
+        K = cache.insert(q, backend::kernel(q, src.str(), "spmv"));
+    }
+
+    return K->second;
 }
 
 //---------------------------------------------------------------------------
@@ -126,10 +175,10 @@ void run_benchmark(int m) {
         x = math::constant<block<B,1>>(1.0);
         y = A * x;
 
-        prof.tic_cl("spmv (block) x100");
+        prof.tic_cl("spmv x100");
         for(int i = 0; i < 100; ++i)
             y = A * x;
-        prof.toc("spmv (block) x100");
+        prof.toc("spmv x100");
         prof.toc("vexcl");
     }
 
@@ -141,20 +190,49 @@ void run_benchmark(int m) {
 
         for(auto &v : x) v = math::constant<block<B,1>>(1.0);
 
-        prof.tic_cpu("spmv (block) x100");
-        for(int k = 0; k < 100; ++k) {
+        prof.tic_cpu("spmv x100");
+        for(int i = 0; i < 100; ++i)
             amgcl::backend::spmv(1.0, boost::tie(n, ptr, col, val), x, 0.0, y);
-            /*
-            for(int i = 0; i < n; ++i) {
-                block<B,1> s = math::zero<block<B,1>>();
-                for(int j = ptr[i], e = ptr[i+1]; j < e; ++j)
-                    s += val[j] * x[col[j]];
-                y[i] = s;
-            }
-            */
-        }
-        prof.toc("spmv (block) x100");
+        prof.toc("spmv x100");
         prof.toc("cpu");
+    }
+
+    // Block-optimized
+    {
+        prof.tic_cl("custom");
+        prof.tic_cl("transfer");
+        vex::sparse::ell<block<B,B>,int> A(ctx, n, n, ptr, col, val);
+        prof.toc("transfer");
+
+        prof.tic_cl("convert");
+        vex::vector<double> ell_val(ctx, A.ell_pitch * A.ell_width * B * B);
+        typedef block<B,B> block_BB;
+        VEX_FUNCTION(void, chidx, (int, i)(int, n)(block_BB*, v_in)(double*, v_out)(int, B),
+                for(int j = 0, m = 0; j < B; ++j)
+                    for(int k = 0; k < B; ++k, ++m)
+                        v_out[m * n + i] = v_in[i](j,k);
+                );
+        vex::eval(chidx(
+                    vex::element_index(0, ell_val.size()), A.ell_pitch * A.ell_width,
+                    vex::raw_pointer(vex::vector<block<B,B>>(ctx.queue(0), A.ell_val)),
+                    vex::raw_pointer(ell_val),
+                    B),
+                ctx, {0, A.ell_pitch * A.ell_width});
+        prof.toc("convert");
+
+        vex::vector<block<B,1>> x(ctx, n), y(ctx, n);
+        x = math::constant<block<B,1>>(1.0);
+
+        auto &K = spmv_kernel<B>(ctx.queue(0));
+        K(ctx.queue(0), (int)n, (int)A.ell_width, (int)A.ell_pitch,
+                A.ell_col, ell_val(0), x(0), y(0));
+
+        prof.tic_cl("spmv x100");
+        for(int i = 0; i < 100; ++i)
+            K(ctx.queue(0), (int)n, (int)A.ell_width, (int)A.ell_pitch,
+                    A.ell_col, ell_val(0), x(0), y(0));
+        prof.toc("spmv x100");
+        prof.toc("custom");
     }
 
     std::cout << prof << std::endl;
