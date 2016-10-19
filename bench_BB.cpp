@@ -95,6 +95,81 @@ int poisson3d(
 
 //---------------------------------------------------------------------------
 template <int B>
+vex::backend::kernel& blocked_spmv_kernel(vex::backend::command_queue &q) {
+    using namespace vex;
+    using namespace vex::detail;
+    static kernel_cache cache;
+
+    auto K = cache.find(q);
+    if (K == cache.end()) {
+        backend::source_generator src(q);
+
+         /* The following kernel uses B*B threads for each B*B block -> continguous memory reads for A
+         *  - Performance for B=1 is similar (within 10 percent) to 'normal' kernel
+         *  - Performance for B=2 is about 2x slower than the 'naive' kernel
+         *  - Performance for B=4 is 10x faster than the 'naive' kernel, because it avoids strided memory access
+         * Performances are from a Tesla C2070.
+         */
+       src.kernel("blocked_spmv").open("(")
+            .template parameter<int>("N")
+            .template parameter<int>("ell_width")
+            .template parameter<int>("ell_pitch")
+            .template parameter< global_ptr<const int> >("ell_col")
+            .template parameter< global_ptr<const double> >("ell_val")
+            .template parameter< global_ptr<const double> >("x")
+            .template parameter< global_ptr<double> >("y")
+            .close(")").open("{");
+
+        src.new_line() << " size_t global_id   = " << src.global_id(0) << ";";
+        src.new_line() << " size_t global_size = " << src.global_size(0) << ";";
+ 
+        src.new_line() << "#define B   " << B;
+        src.new_line() << " size_t subwarp_size = B * B;";
+        src.new_line() << " size_t subwarp_idx = " << src.local_size(0) << " % subwarp_size;";
+        src.new_line() << " size_t subwarp_i = subwarp_idx / B;";
+        src.new_line() << " size_t subwarp_j = subwarp_idx % B;";
+
+        src.new_line().smem_static_var("double", "row_A[1024]");
+        src.new_line().smem_static_var("double", "row_x[1024/B]");
+#ifdef VEXCL_BACKEND_OPENCL
+        src.new_line().smem_static_var("double", "*my_A = row_A + subwarp_idx * subwarp_size");
+        src.new_line().smem_static_var("double", "*my_x = row_x + subwarp_idx * B");
+#else
+        src.new_line() << " double *my_A = row_A + subwarp_idx * subwarp_size;";
+        src.new_line() << " double *my_x = row_x + subwarp_idx * B;";
+#endif
+        src.new_line() << " double my_y;";
+
+        src.new_line() << " for (size_t row = global_id / subwarp_size; row < N; row += global_size / subwarp_size)";
+        src.open("{");
+        src.new_line() << "   my_y = 0;";
+        src.new_line() << "   size_t offset = row;";
+        src.new_line() << "   for (size_t i = 0; i < ell_width; ++i, offset += ell_pitch) {";
+        src.new_line() << "     int c = ell_col[offset];";
+
+        src.new_line() << "     my_A[subwarp_i * B + subwarp_j] = (c >= 0) ? ell_val[subwarp_size * offset + subwarp_i * B + subwarp_j] : 0.0;";
+        src.new_line() << "     my_x[subwarp_i]                 = (c >= 0) ? x[B * c + subwarp_i] : 0.0;";
+
+        src.new_line() << "     for (size_t k=0; k<B; ++k)";
+        src.new_line() << "       my_y += my_A[subwarp_i * B + k] * my_x[k];";
+        src.new_line() << "  }";
+
+        src.new_line() << "  if (subwarp_j == 0) ";
+        src.new_line() << "   y[row+subwarp_i] = my_y;";
+
+        src.close("}"); // for
+        src.close("}"); // kernel
+
+        K = cache.insert(q, backend::kernel(q, src.str(), "blocked_spmv"));
+    }
+
+    return K->second;
+}
+
+
+
+//---------------------------------------------------------------------------
+template <int B>
 void run_benchmark(int m) {
     namespace math = amgcl::math;
 
@@ -138,85 +213,19 @@ void run_benchmark(int m) {
         prof.tic_cl("custom kernel");
 
         vex::sparse::ell<block<B,B>,int> A(ctx, n, n, ptr, col, val);
-
-        std::stringstream ss;
-        ss << "#define B    " << B << std::endl;   // NOTE: This is emulating CUDA templates without the problems of external linkage
-
-        /* The following kernel uses B*B threads for each B*B block -> continguous memory reads for A
-         *  - Performance for B=1 is similar (within 10 percent) to 'normal' kernel
-         *  - Performance for B=2 is about 2x slower than the 'naive' kernel
-         *  - Performance for B=4 is 10x faster than the 'naive' kernel, because it avoids strided memory access
-         * Performances are from a Tesla C2070.
-         */
-        vex::backend::kernel blocked_spmv(ctx.queue(0), ss.str() + VEX_STRINGIZE_SOURCE(
-             extern "C"
-             __global__ void blocked_spmv(unsigned long N, \n
-                                          const int *ell_col, const double *ell_val, unsigned long ell_width, unsigned long ell_pitch, \n
-                                          const int *csr_ptr, const int *csr_col, const double *csr_val,\n
-                                          const double *x, double *y)\n
-             {\n
-               size_t global_id   = blockDim.x * blockIdx.x + threadIdx.x;\n
-               size_t global_size = gridDim.x * blockDim.x;\n
-               
-               size_t subwarp_size = B * B;\n
-               size_t subwarp_idx = blockDim.x % subwarp_size;\n
-               size_t subwarp_i = subwarp_idx / B;\n
-               size_t subwarp_j = subwarp_idx % B;\n
-
-               // shared memory, one thread per block element. Assuming a maximum of 1024 threads.
-               // TODO: use actual thread block size
-               __shared__ double row_A[1024]; double *my_A = row_A + subwarp_idx * subwarp_size;\n
-               __shared__ double row_x[1024/B]; double *my_x = row_x + subwarp_idx * B;\n
-               double my_y;\n
-
-               for (size_t row = global_id / subwarp_size; row < N; row += global_size / subwarp_size)\n
-               {\n
-                 my_y = 0;\n
-
-                 // ELL part:\n
-                 size_t offset = row;\n
-                 for (size_t i = 0; i < ell_width; ++i, offset += ell_pitch) {\n
-                   int c = ell_col[offset];\n
-                   
-                   // load data to shared memory
-                   my_A[subwarp_i * B + subwarp_j] = (c >= 0) ? ell_val[subwarp_size * offset + subwarp_i * B + subwarp_j] : 0.0;\n
-                   my_x[subwarp_i]                 = (c >= 0) ? x[B * c + subwarp_i] : 0.0;\n
-
-                   // compute: (all threads participate. Maybe reduce to just one thread per row?)
-                   for (size_t k=0; k<B; ++k)\n
-                     my_y += my_A[subwarp_i * B + k] * my_x[k];\n
-                   
-                 }\n
-
-                 // CSR part: TODO  \n
-                 //if (csr_ptr) {\n
-                 //  size_t col_end = csr_ptr[row+1]; \n
-                 //  for (size_t j=csr_ptr[row]; j<col_end; ++j)\n
-                 //    sum += x[csr_col[j]] * csr_val[j];\n
-                 //}
-
-                 // write result:
-                 if (subwarp_j == 0)
-                   y[row+subwarp_i] = my_y;\n
-               }\n
-             }\n        
-          ),"blocked_spmv", 0);
-
         vex::vector<block<B,1>> x(ctx, n), y(ctx, n);
         x = math::constant<block<B,1>>(1.0);
         y = math::constant<block<B,1>>(1.0);
 
-        blocked_spmv(ctx.queue(0), static_cast<cl_ulong>(n),
-                     A.ell_col, A.ell_val, static_cast<cl_ulong>(A.ell_width), static_cast<cl_ulong>(A.ell_pitch),
-                     A.csr_ptr, A.csr_col, A.csr_val,
-                     x(0), y(0));
+        auto &K = blocked_spmv_kernel<B>(ctx.queue(0));
+        K(ctx.queue(0), (int)n, (int)A.ell_width, (int)A.ell_pitch,
+                A.ell_col, A.ell_val, x(0), y(0));
 
         prof.tic_cl("spmv (custom) x100");
         for(int i = 0; i < 100; ++i)
-          blocked_spmv(ctx.queue(0), static_cast<cl_ulong>(n),
-                       A.ell_col, A.ell_val, static_cast<cl_ulong>(A.ell_width), static_cast<cl_ulong>(A.ell_pitch),
-                       A.csr_ptr, A.csr_col, A.csr_val,
-                       x(0), y(0));
+          K(ctx.queue(0), (int)n, (int)A.ell_width, (int)A.ell_pitch,
+                A.ell_col, A.ell_val, x(0), y(0));
+
         prof.toc("spmv (custom) x100");
         prof.toc("custom kernel");
     }
