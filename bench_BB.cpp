@@ -125,18 +125,19 @@ vex::backend::kernel& blocked_spmv_kernel(vex::backend::command_queue &q) {
  
         src.new_line() << "#define B   " << B;
         src.new_line() << " size_t subwarp_size = B * B;";
-        src.new_line() << " size_t subwarp_idx = " << src.local_size(0) << " % subwarp_size;";
+        src.new_line() << " size_t subwarp_idx = " << src.local_id(0) << " % subwarp_size;";
+        src.new_line() << " size_t subwarp_gid = " << src.local_id(0) << " / subwarp_size;";
         src.new_line() << " size_t subwarp_i = subwarp_idx / B;";
         src.new_line() << " size_t subwarp_j = subwarp_idx % B;";
 
         src.new_line().smem_static_var("double", "row_A[1024]");
         src.new_line().smem_static_var("double", "row_x[1024/B]");
 #ifdef VEXCL_BACKEND_OPENCL
-        src.new_line().smem_static_var("double", "*my_A = row_A + subwarp_idx * subwarp_size");
-        src.new_line().smem_static_var("double", "*my_x = row_x + subwarp_idx * B");
+        src.new_line().smem_static_var("double", "*my_A = row_A + subwarp_gid * subwarp_size");
+        src.new_line().smem_static_var("double", "*my_x = row_x + subwarp_gid * B");
 #else
-        src.new_line() << " double *my_A = row_A + subwarp_idx * subwarp_size;";
-        src.new_line() << " double *my_x = row_x + subwarp_idx * B;";
+        src.new_line() << " double *my_A = row_A + subwarp_gid * subwarp_size;";
+        src.new_line() << " double *my_x = row_x + subwarp_gid * B;";
 #endif
         src.new_line() << " double my_y;";
 
@@ -155,7 +156,7 @@ vex::backend::kernel& blocked_spmv_kernel(vex::backend::command_queue &q) {
         src.new_line() << "  }";
 
         src.new_line() << "  if (subwarp_j == 0) ";
-        src.new_line() << "   y[row+subwarp_i] = my_y;";
+        src.new_line() << "    y[B*row+subwarp_i] = my_y;";
 
         src.close("}"); // for
         src.close("}"); // kernel
@@ -189,6 +190,27 @@ void run_benchmark(int m) {
     int n = poisson3d(m, ptr, col, val);
     prof.toc("assemble");
 
+    std::vector<block<B,1>> r(n);
+    std::generate_n(reinterpret_cast<double*>(r.data()), n * B, drand48);
+    /*for (size_t i=0; i<n; ++i)
+      for (size_t k=0; k<B; ++k)
+        r[i](k) = 1.0;*/
+
+    vex::vector<block<B,1>> x(ctx, r);
+
+    // CPU
+    std::vector<block<B,1>> Y(n);
+    {
+        prof.tic_cpu("cpu");
+
+        prof.tic_cpu("spmv (block) x100");
+        for(int k = 0; k < 100; ++k)
+            amgcl::backend::spmv(1.0, boost::tie(n, ptr, col, val), r, 0.0, Y);
+        prof.toc("spmv (block) x100");
+        prof.toc("cpu");
+    }
+
+
     // VexCL
     {
         prof.tic_cl("vexcl");
@@ -196,7 +218,7 @@ void run_benchmark(int m) {
         vex::sparse::ell<block<B,B>,int> A(ctx, n, n, ptr, col, val);
         prof.toc("transfer");
 
-        vex::vector<block<B,1>> x(ctx, n), y(ctx, n);
+        vex::vector<block<B,1>> y(ctx, n);
 
         x = math::constant<block<B,1>>(1.0);
         y = A * x;
@@ -205,6 +227,16 @@ void run_benchmark(int m) {
         for(int i = 0; i < 100; ++i)
             y = A * x;
         prof.toc("spmv (block) x100");
+
+        prof.tic_cl("checking");
+        auto v = y.map(0);
+        double delta = 0;
+        for(int i = 0; i < n; ++i)
+            for(int k = 0; k < B; ++k)
+                delta += std::abs(Y[i](k) - v[i](k));
+        std::cout << "delta = " << delta << std::endl;
+        prof.toc("checking");
+
         prof.toc("vexcl");
     }
 
@@ -213,8 +245,7 @@ void run_benchmark(int m) {
         prof.tic_cl("custom kernel");
 
         vex::sparse::ell<block<B,B>,int> A(ctx, n, n, ptr, col, val);
-        vex::vector<block<B,1>> x(ctx, n), y(ctx, n);
-        x = math::constant<block<B,1>>(1.0);
+        vex::vector<block<B,1>> y(ctx, n);
         y = math::constant<block<B,1>>(1.0);
 
         auto &K = blocked_spmv_kernel<B>(ctx.queue(0));
@@ -227,31 +258,17 @@ void run_benchmark(int m) {
                 A.ell_col, A.ell_val, x(0), y(0));
 
         prof.toc("spmv (custom) x100");
+
+        prof.tic_cl("checking");
+        auto v = y.map(0);
+        double delta = 0;
+        for(int i = 0; i < n; ++i)
+            for(int k = 0; k < B; ++k)
+                delta += std::abs(Y[i](k) - v[i](k));
+        std::cout << "delta = " << delta << std::endl;
+        prof.toc("checking");
+
         prof.toc("custom kernel");
-    }
-
-    // CPU
-    {
-        prof.tic_cpu("cpu");
-
-        std::vector<block<B,1>> x(n), y(n);
-
-        for(auto &v : x) v = math::constant<block<B,1>>(1.0);
-
-        prof.tic_cpu("spmv (block) x100");
-        for(int k = 0; k < 100; ++k) {
-            amgcl::backend::spmv(1.0, boost::tie(n, ptr, col, val), x, 0.0, y);
-            /*
-            for(int i = 0; i < n; ++i) {
-                block<B,1> s = math::zero<block<B,1>>();
-                for(int j = ptr[i], e = ptr[i+1]; j < e; ++j)
-                    s += val[j] * x[col[j]];
-                y[i] = s;
-            }
-            */
-        }
-        prof.toc("spmv (block) x100");
-        prof.toc("cpu");
     }
 
     std::cout << prof << std::endl;
@@ -295,7 +312,7 @@ int main(int argc, char *argv[]) {
 
     switch(vm["block-size"].as<int>()) {
         case 1:
-            run_benchmark<1>(vm["size"].as<int>());
+            //run_benchmark<1>(vm["size"].as<int>());
             break;
 	case 2:
             run_benchmark<2>(vm["size"].as<int>());
@@ -308,6 +325,12 @@ int main(int argc, char *argv[]) {
             break;
 	case 5:
             run_benchmark<5>(vm["size"].as<int>());
+            break;
+	case 8:
+            run_benchmark<8>(vm["size"].as<int>());
+            break;
+ 	case 16:
+            run_benchmark<16>(vm["size"].as<int>());
             break;
         default:
             std::cerr << "Unsupported block size" << std::endl;
