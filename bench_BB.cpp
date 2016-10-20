@@ -241,6 +241,83 @@ vex::backend::kernel& blocked_spmv_kernel2(vex::backend::command_queue &q) {
     return K->second;
 }
 
+//---------------------------------------------------------------------------
+template <int B>
+vex::backend::kernel& blocked_spmv_kernel3(vex::backend::command_queue &q) {
+    using namespace vex;
+    using namespace vex::detail;
+    static kernel_cache cache;
+
+    auto K = cache.find(q);
+    if (K == cache.end()) {
+        backend::source_generator src(q);
+
+         /* The following kernel uses B threads for each B*B block -> more continguous memory reads for A
+         * Performances are from a Tesla C2070.
+         */
+       src.kernel("blocked_spmv3").open("(")
+            .template parameter<int>("N")
+            .template parameter<int>("ell_width")
+            .template parameter<int>("ell_pitch")
+            .template parameter< global_ptr<const int> >("ell_col")
+            .template parameter< global_ptr<const double> >("ell_val")
+            .template parameter< global_ptr<const double> >("x")
+            .template parameter< global_ptr<double> >("y")
+            .close(")").open("{");
+
+        src.new_line() << " size_t global_id   = " << src.global_id(0) << ";";
+        src.new_line() << " size_t global_size = " << src.global_size(0) << ";";
+ 
+        src.new_line() << " #define subwarp_size " << B;
+        src.new_line() << " const size_t subwarp_gid = " << src.local_id(0) << " / subwarp_size;";
+        src.new_line() << " const size_t subwarp_idx = " << src.local_id(0) << " % subwarp_size;";
+
+        src.new_line().smem_static_var("double", "row_A[256*subwarp_size]");
+        src.new_line().smem_static_var("double", "row_x[256]");
+#ifdef VEXCL_BACKEND_OPENCL
+        src.new_line().smem_static_var("double", "*my_A = row_A + subwarp_gid * subwarp_size * subwarp_size");
+        src.new_line().smem_static_var("double", "*my_x = row_x + subwarp_gid * subwarp_size");
+#else
+        src.new_line() << " double *my_A = row_A + subwarp_gid * subwarp_size * subwarp_size;";
+        src.new_line() << " double *my_x = row_x + subwarp_gid * subwarp_size;";
+#endif
+        src.new_line() << " double my_y;";
+
+        src.new_line() << " size_t loop_iters = (N-1) / global_size + 1;";
+
+        src.new_line() << " for (size_t iter = 0; iter < loop_iters; ++iter)";
+        src.open("{");
+        src.new_line() << "  for (size_t j=0; j<subwarp_size; ++j) { ";
+        src.new_line() << "   size_t row = (global_id + j * global_size) / subwarp_size + iter * global_size;";
+        src.new_line() << "   my_y = 0;";
+        src.new_line() << "   size_t offset = min((int)row, (int)N-1);";
+        src.new_line() << "   for (size_t i = 0; i < ell_width; ++i, offset += ell_pitch) {";
+        src.new_line() << "     int c = ell_col[offset];";
+
+        src.new_line() << "     size_t ell_val_offset = subwarp_size * subwarp_size * offset + subwarp_idx;";
+        src.new_line() << "     for (size_t k=0; k<subwarp_size; ++k) ";
+        src.new_line() << "       my_A[k * subwarp_size + subwarp_idx] = (c >= 0) ? ell_val[ell_val_offset + k * subwarp_size] : 0.0;";
+        src.new_line() << "     my_x[subwarp_idx] = (c >= 0) ? x[subwarp_size * c + subwarp_idx] : 0.0;";
+        src.new_line().barrier();
+
+        src.new_line() << "     for (size_t k=0; k<subwarp_size; ++k)";
+        src.new_line() << "       my_y += my_A[subwarp_idx * subwarp_size + k] * my_x[k];";
+        src.new_line() << "   }";
+
+        src.new_line() << "   if (row < N)";
+        src.new_line() << "     y[subwarp_size*row+subwarp_idx] = my_y;";
+        src.new_line() << "  }";
+
+
+        src.close("}"); // for
+        src.close("}"); // kernel
+
+        K = cache.insert(q, backend::kernel(q, src.str(), "blocked_spmv3"));
+    }
+
+    return K->second;
+}
+
 
 
 //---------------------------------------------------------------------------
@@ -376,6 +453,38 @@ void run_benchmark(int m) {
         prof.toc("checking");
 
         prof.toc("custom B kernel");
+    }
+
+    // blocked kernel, B threads per BxB block, one thread per row overall
+    {
+        prof.tic_cl("custom 1 kernel");
+
+        vex::sparse::ell<block<B,B>,int> A(ctx, n, n, ptr, col, val);
+        vex::vector<block<B,1>> y(ctx, n);
+        y = math::constant<block<B,1>>(1.0);
+
+        auto &K = blocked_spmv_kernel3<B>(ctx.queue(0));
+        K.config(256, 256);
+        K(ctx.queue(0), (int)n, (int)A.ell_width, (int)A.ell_pitch,
+                A.ell_col, A.ell_val, x(0), y(0));
+
+        prof.tic_cl("spmv (1) x100");
+        for(int i = 0; i < 100; ++i)
+          K(ctx.queue(0), (int)n, (int)A.ell_width, (int)A.ell_pitch,
+                A.ell_col, A.ell_val, x(0), y(0));
+
+        prof.toc("spmv (1) x100");
+
+        prof.tic_cl("checking");
+        auto v = y.map(0);
+        double delta = 0;
+        for(int i = 0; i < n; ++i)
+            for(int k = 0; k < B; ++k)
+                delta += std::abs(Y[i](k) - v[i](k));
+        std::cout << "delta = " << delta << std::endl;
+        prof.toc("checking");
+
+        prof.toc("custom 1 kernel");
     }
 
 
