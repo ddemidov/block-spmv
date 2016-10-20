@@ -131,32 +131,33 @@ vex::backend::kernel& blocked_spmv_kernel(vex::backend::command_queue &q) {
         src.new_line() << " size_t subwarp_j = subwarp_idx % B;";
 
         src.new_line().smem_static_var("double", "row_A[256]");
-        src.new_line().smem_static_var("double", "row_x[256/B]");
 #ifdef VEXCL_BACKEND_OPENCL
-        src.new_line().smem_static_var("double", "*my_A = row_A + subwarp_gid * subwarp_size");
-        src.new_line().smem_static_var("double", "*my_x = row_x + subwarp_gid * B");
+        src.new_line().smem_static_var("double", "*my_A = row_A + subwarp_gid * subwarp_size + subwarp_i * B");
 #else
-        src.new_line() << " double *my_A = row_A + subwarp_gid * subwarp_size;";
-        src.new_line() << " double *my_x = row_x + subwarp_gid * B;";
+        src.new_line() << " double *my_A = row_A + subwarp_gid * subwarp_size + subwarp_i * B;";
 #endif
         src.new_line() << " double my_y;";
 
-        src.new_line() << " for (size_t row = global_id / subwarp_size; row < N; row += global_size / subwarp_size)";
+        src.new_line() << " size_t loop_iters = (N-1) / (global_size / subwarp_size) + 1;";
+
+        src.new_line() << " for (size_t iter = 0; iter < loop_iters; ++iter)";
         src.open("{");
+        src.new_line() << "   size_t row = (global_id + iter * global_size) / subwarp_size;";
         src.new_line() << "   my_y = 0;";
-        src.new_line() << "   size_t offset = row;";
+        src.new_line() << "   size_t offset = min((int)row, (int)N-1);";
         src.new_line() << "   for (size_t i = 0; i < ell_width; ++i, offset += ell_pitch) {";
         src.new_line() << "     int c = ell_col[offset];";
 
-        src.new_line() << "     my_A[subwarp_i * B + subwarp_j] = (c >= 0) ? ell_val[subwarp_size * offset + subwarp_i * B + subwarp_j] : 0.0;";
-        src.new_line() << "     my_x[subwarp_i]                 = (c >= 0) ? x[B * c + subwarp_i] : 0.0;";
+        src.new_line() << "     my_A[subwarp_j] = (c >= 0) ? ell_val[subwarp_size * offset + subwarp_i * B + subwarp_j] * x[B * c + subwarp_i] : 0.0;";
+        src.new_line().barrier();
+        for (std::size_t stride = B/2; stride > 0; stride /= 2)
+	  src.new_line() << "       my_A[subwarp_j] += my_A[subwarp_j ^ " << stride << "];";
 
-        src.new_line() << "     for (size_t k=0; k<B; ++k)";
-        src.new_line() << "       my_y += my_A[subwarp_i * B + k] * my_x[k];";
-        src.new_line() << "  }";
+        src.new_line() << "     my_y += my_A[subwarp_j];"; // only subwarp_j == 0 relevant
+        src.new_line() << "   }";
 
-        src.new_line() << "  if (subwarp_j == 0) ";
-        src.new_line() << "    y[B*row+subwarp_i] = my_y;";
+        src.new_line() << "   if (subwarp_j == 0 && row < N) ";
+        src.new_line() << "     y[B*row+subwarp_i] = my_y;";
 
         src.close("}"); // for
         src.close("}"); // kernel
@@ -199,15 +200,12 @@ vex::backend::kernel& blocked_spmv_kernel2(vex::backend::command_queue &q) {
         src.new_line() << " const size_t subwarp_idx = " << src.local_id(0) << " % subwarp_size;";
 
         src.new_line().smem_static_var("double", "row_A[256*subwarp_size]");
-        src.new_line().smem_static_var("double", "row_x[256]");
 #ifdef VEXCL_BACKEND_OPENCL
         src.new_line().smem_static_var("double", "*my_A = row_A + subwarp_gid * subwarp_size * subwarp_size");
-        src.new_line().smem_static_var("double", "*my_x = row_x + subwarp_gid * subwarp_size");
 #else
         src.new_line() << " double *my_A = row_A + subwarp_gid * subwarp_size * subwarp_size;";
-        src.new_line() << " double *my_x = row_x + subwarp_gid * subwarp_size;";
 #endif
-        src.new_line() << " double my_y;";
+        src.new_line() << " double my_x, my_y;";
 
         src.new_line() << " size_t loop_iters = (N-1) / (global_size / subwarp_size) + 1;";
 
@@ -220,13 +218,13 @@ vex::backend::kernel& blocked_spmv_kernel2(vex::backend::command_queue &q) {
         src.new_line() << "     int c = ell_col[offset];";
 
         src.new_line() << "     size_t ell_val_offset = subwarp_size * subwarp_size * offset + subwarp_idx;";
+        src.new_line() << "     my_x = (c >= 0) ? x[subwarp_size * c + subwarp_idx] : 0.0;";
         src.new_line() << "     for (size_t k=0; k<subwarp_size; ++k) ";
-        src.new_line() << "       my_A[k * subwarp_size + subwarp_idx] = (c >= 0) ? ell_val[ell_val_offset + k * subwarp_size] : 0.0;";
-        src.new_line() << "     my_x[subwarp_idx] = (c >= 0) ? x[subwarp_size * c + subwarp_idx] : 0.0;";
+        src.new_line() << "       my_A[k * subwarp_size + subwarp_idx] = (c >= 0) ? ell_val[ell_val_offset + k * subwarp_size] * my_x : 0.0;";
         src.new_line().barrier();
 
         src.new_line() << "     for (size_t k=0; k<subwarp_size; ++k)";
-        src.new_line() << "       my_y += my_A[subwarp_idx * subwarp_size + k] * my_x[k];";
+        src.new_line() << "       my_y += my_A[subwarp_idx * subwarp_size + k];";
         src.new_line() << "   }";
 
         src.new_line() << "   if (row < N)";
@@ -273,15 +271,12 @@ vex::backend::kernel& blocked_spmv_kernel3(vex::backend::command_queue &q) {
         src.new_line() << " const size_t subwarp_idx = " << src.local_id(0) << " % subwarp_size;";
 
         src.new_line().smem_static_var("double", "row_A[256*subwarp_size]");
-        src.new_line().smem_static_var("double", "row_x[256]");
 #ifdef VEXCL_BACKEND_OPENCL
         src.new_line().smem_static_var("double", "*my_A = row_A + subwarp_gid * subwarp_size * subwarp_size");
-        src.new_line().smem_static_var("double", "*my_x = row_x + subwarp_gid * subwarp_size");
 #else
         src.new_line() << " double *my_A = row_A + subwarp_gid * subwarp_size * subwarp_size;";
-        src.new_line() << " double *my_x = row_x + subwarp_gid * subwarp_size;";
 #endif
-        src.new_line() << " double my_y;";
+        src.new_line() << " double my_x, my_y;";
 
         src.new_line() << " size_t loop_iters = (N-1) / global_size + 1;";
 
@@ -295,13 +290,13 @@ vex::backend::kernel& blocked_spmv_kernel3(vex::backend::command_queue &q) {
         src.new_line() << "     int c = ell_col[offset];";
 
         src.new_line() << "     size_t ell_val_offset = subwarp_size * subwarp_size * offset + subwarp_idx;";
+        src.new_line() << "     my_x = (c >= 0) ? x[subwarp_size * c + subwarp_idx] : 0.0;";
         src.new_line() << "     for (size_t k=0; k<subwarp_size; ++k) ";
-        src.new_line() << "       my_A[k * subwarp_size + subwarp_idx] = (c >= 0) ? ell_val[ell_val_offset + k * subwarp_size] : 0.0;";
-        src.new_line() << "     my_x[subwarp_idx] = (c >= 0) ? x[subwarp_size * c + subwarp_idx] : 0.0;";
+        src.new_line() << "       my_A[k * subwarp_size + subwarp_idx] = (c >= 0) ? ell_val[ell_val_offset + k * subwarp_size] * my_x : 0.0;";
         src.new_line().barrier();
 
         src.new_line() << "     for (size_t k=0; k<subwarp_size; ++k)";
-        src.new_line() << "       my_y += my_A[subwarp_idx * subwarp_size + k] * my_x[k];";
+        src.new_line() << "       my_y += my_A[subwarp_idx * subwarp_size + k];";
         src.new_line() << "   }";
 
         src.new_line() << "   if (row < N)";
