@@ -144,6 +144,75 @@ vex::backend::kernel& spmv_kernel(vex::backend::command_queue &q) {
 
 //---------------------------------------------------------------------------
 template <int B>
+vex::backend::kernel& coop_kernel(vex::backend::command_queue &q) {
+    using namespace vex;
+    using namespace vex::detail;
+    static kernel_cache cache;
+
+    auto K = cache.find(q);
+    if (K == cache.end()) {
+        backend::source_generator src(q);
+
+        src.function<void>("load_blocks").open("(")
+            .template parameter<int>("nblocks")
+            .template parameter< shared_ptr<double> >("dst")
+            .template parameter< global_ptr<const double> >("src")
+            .template parameter< regstr_ptr<double> >("block")
+            .close(")")
+            .open("{");
+        src.new_line() << "int n = nblocks * " << B * B << ";";
+        src.new_line() << "int lid = " << src.local_id(0) << ";";
+        src.new_line() << "int lsz = " << src.local_size(0) << ";";
+        src.new_line() << "int beg = lid * " << B * B << ";";
+        src.new_line() << "for(int j = lid; j < n; j += lsz)";
+        src.new_line() << "  dst[j] = src[j];";
+        src.new_line().barrier();
+        src.new_line() << "for(int j = 0; j < " << B * B << "; ++j)";
+        src.new_line() << "  block[j] = dst[beg + j];";
+        src.new_line().barrier();
+        src.close("}");
+
+        src.kernel("spmv").open("(")
+            .template parameter<int>("n")
+            .template parameter<int>("ell_width")
+            .template parameter<int>("ell_pitch")
+            .template parameter< global_ptr<const int> >("ell_col")
+            .template parameter< global_ptr<const block<B,B> > >("ell_val")
+            .template parameter< global_ptr<const block<B,1> > >("X")
+            .template parameter< global_ptr<block<B,1> > >("Y")
+            .template smem_parameter<double>("S")
+            .close(")").open("{");
+
+        src.smem_declaration<double>("S");
+
+        src.new_line() << "int block_start = " << src.group_id(0) << " * " << src.local_size(0) << ";";
+        src.new_line() << "int lid = " << src.local_id(0) << ";";
+        src.new_line() << "int lsz = " << src.local_size(0) << ";";
+        src.new_line() << "int gsz = " << src.global_size(0) << ";";
+        src.new_line() << "for(int idx = " << src.global_id(0) << ", pos = 0; pos < n; idx += gsz, pos += gsz, block_start += gsz)";
+        src.open("{");
+        src.new_line() << type_name<block<B,1>>() << " sum = " << block<B,1>() << ";";
+        src.new_line() << type_name<block<B,B>>() << " A;";
+        src.new_line() << "int blocks_to_load = min(block_start + lsz, n) - block_start;";
+        src.new_line() << "for(int j = 0; j < ell_width; ++j) {";
+        src.new_line() << "  load_blocks(blocks_to_load, S, reinterpret_cast<" << type_name< global_ptr<const double> >() << ">(ell_val + j * ell_pitch + block_start), reinterpret_cast<double*>(&A));";
+        src.new_line() << "  if (idx >= n) continue;";
+        src.new_line() << "  int c = ell_col[j * ell_pitch + idx];";
+        src.new_line() << "  if (c < 0) continue;";
+        src.new_line() << "  sum += A * X[c];";
+        src.new_line() << "}";
+        src.new_line() << "if (idx < n) Y[idx] = sum;";
+        src.close("}");
+        src.close("}");
+
+        K = cache.insert(q, backend::kernel(q, src.str(), "spmv", B*B*sizeof(double)));
+    }
+
+    return K->second;
+}
+
+//---------------------------------------------------------------------------
+template <int B>
 void run_benchmark(int m) {
     namespace math = amgcl::math;
 
@@ -163,28 +232,9 @@ void run_benchmark(int m) {
     int n = poisson3d(m, ptr, col, val);
     prof.toc("assemble");
 
-    // VexCL
-    {
-        prof.tic_cl("vexcl");
-        prof.tic_cl("transfer");
-        vex::sparse::ell<block<B,B>,int> A(ctx, n, n, ptr, col, val);
-        prof.toc("transfer");
-
-        vex::vector<block<B,1>> x(ctx, n), y(ctx, n);
-
-        x = math::constant<block<B,1>>(1.0);
-        y = A * x;
-
-        prof.tic_cl("spmv x100");
-        for(int i = 0; i < 100; ++i)
-            y = A * x;
-        prof.toc("spmv x100");
-        prof.toc("vexcl");
-    }
-
     // CPU
     std::vector<block<B,1>> Y(n);
-    {
+    if (1) {
         prof.tic_cpu("cpu");
 
         std::vector<block<B,1>> x(n);
@@ -198,9 +248,37 @@ void run_benchmark(int m) {
         prof.toc("cpu");
     }
 
-    // Block-optimized
-    {
-        prof.tic_cl("custom");
+    // VexCL
+    if (1){
+        prof.tic_cl("vexcl");
+        prof.tic_cl("transfer");
+        vex::sparse::ell<block<B,B>,int> A(ctx, n, n, ptr, col, val);
+        prof.toc("transfer");
+
+        vex::vector<block<B,1>> x(ctx, n), y(ctx, n);
+
+        x = math::constant<block<B,1>>(1.0);
+        y = A * x;
+
+        prof.tic_cl("spmv x100");
+        for(int i = 0; i < 100; ++i)
+            y = A * x;
+        double tm = prof.toc("spmv x100");
+
+        prof.tic_cl("checking");
+        auto v = y.map(0);
+        double delta = 0;
+        for(int i = 0; i < n; ++i)
+            for(int k = 0; k < B; ++k)
+                delta += std::abs(Y[i](k) - v[i](k));
+        prof.toc("checking");
+        prof.toc("vexcl");
+        std::cout << "vexcl: " << tm << ", delta = " << delta << std::endl;
+    }
+
+    // Block-optimized 1
+    if (1){
+        prof.tic_cl("reorder");
         prof.tic_cl("transfer");
         vex::sparse::ell<block<B,B>,int> A(ctx, n, n, ptr, col, val);
         prof.toc("transfer");
@@ -233,17 +311,55 @@ void run_benchmark(int m) {
         for(int i = 0; i < 100; ++i)
             K(ctx.queue(0), (int)n, (int)A.ell_width, (int)A.ell_pitch,
                     A.ell_col, ell_val(0), x(0), y(0));
-        prof.toc("spmv x100");
-        prof.toc("custom");
-
+        double tm = prof.toc("spmv x100");
         prof.tic_cl("checking");
         auto v = y.map(0);
         double delta = 0;
         for(int i = 0; i < n; ++i)
             for(int k = 0; k < B; ++k)
                 delta += std::abs(Y[i](k) - v[k*n+i]);
-        std::cout << "delta = " << delta << std::endl;
         prof.toc("checking");
+        prof.toc("reorder");
+        std::cout << "reorder: " << tm << ", delta = " << delta << std::endl;
+
+    }
+
+    // Cooperative load
+    {
+        prof.tic_cl("cooperative");
+        prof.tic_cl("transfer");
+        vex::sparse::ell<block<B,B>,int> A(ctx, n, n, ptr, col, val);
+        prof.toc("transfer");
+
+        vex::vector<block<B,1>> x(ctx, n), y(ctx, n);
+
+        x = math::constant<block<B,1>>(1.0);
+
+        auto &K = coop_kernel<B>(ctx.queue(0));
+        K.push_arg((int)n);
+        K.push_arg((int)A.ell_width);
+        K.push_arg((int)A.ell_pitch);
+        K.push_arg(A.ell_col);
+        K.push_arg(A.ell_val);
+        K.push_arg(x(0));
+        K.push_arg(y(0));
+        K.set_smem(B*B*sizeof(double));
+        K(ctx.queue(0));
+
+        prof.tic_cl("spmv x100");
+        for(int i = 0; i < 100; ++i)
+            K(ctx.queue(0));
+        double tm = prof.toc("spmv x100");
+
+        prof.tic_cl("checking");
+        auto v = y.map(0);
+        double delta = 0;
+        for(int i = 0; i < n; ++i)
+            for(int k = 0; k < B; ++k)
+                delta += std::abs(Y[i](k) - v[i](k));
+        prof.toc("checking");
+        prof.toc("cooperative");
+        std::cout << "cooperative:  " << tm << ", delta = " << delta << std::endl;
     }
 
     std::cout << prof << std::endl;
